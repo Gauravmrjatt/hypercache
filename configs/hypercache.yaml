@@ -1,0 +1,26 @@
+# HyperCache node configuration.
+#
+# Every field is optional; values omitted here fall back to the built-in
+# defaults shown below.
+
+server:
+  host: "127.0.0.1"
+  port: 6380
+  # Close client connections idle for this many seconds. 0 disables it.
+  read_timeout_seconds: 0
+
+cache:
+  # Independent key partitions. Higher values reduce lock contention.
+  shard_count: 16
+  # Total memory budget in MiB. 0 disables the memory limit.
+  max_memory_mb: 512
+  # "lru" evicts least-recently-used entries, "none" rejects writes when full.
+  eviction_policy: "lru"
+  # TTL applied by SET when no EX/PX option is given. 0 = no default expiry.
+  default_ttl_seconds: 0
+  # Background sweep for expired keys. 0 disables the sweeper.
+  cleanup_interval_seconds: 1
+
+observability:
+  metrics_enabled: true
+  metrics_port: 9090

@@ -1,0 +1,18 @@
+# Binaries
+bin/
+/hypercache
+*.exe
+*.test
+*.out
+
+# Runtime data
+data/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
