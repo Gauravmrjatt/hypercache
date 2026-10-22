@@ -6,6 +6,11 @@ from scratch in order to understand the parts that make Redis what it is:
 sharding, TTL expiry, eviction, a wire protocol, metrics, and eventually
 replication and failure handling.
 
+In one sentence: HyperCache is a single-node TCP server that accepts simple
+text commands (`SET`, `GET`, ...), spreads the keyspace over independent
+in-memory shards, expires keys by TTL, evicts under memory pressure, and
+reports its own state as Prometheus metrics.
+
 Right now HyperCache is a working single-node server. The next steps are
 replication and failover, then persistence, then hot-key/adaptive features and
 a Redis comparison. The status section near the bottom keeps track of what is
@@ -67,6 +72,105 @@ Non-command features:
   (`eviction_policy: none|lru`)
 - Prometheus `/metrics` endpoint plus `/healthz` on a second port
 - YAML config + flag overrides, shutdown on Ctrl-C / SIGTERM
+
+## Architecture
+
+Everything runs in one process. The client port (6380) and the metrics port
+(9090) are separate listeners.
+
+```
+        client (nc, telnet, app code, tests)
+                       |
+                       | TCP 127.0.0.1:6380, line-per-command text protocol
+                       v
++---------------------------------------------------------------+
+| server (internal/server)                                      |
+|   accept loop            -> one goroutine per connection       |
+|   read line              -> tokenizer -> protocol.Command      |
+|   dispatch               -> handler for that command           |
+|   write reply            -> buffered, flushed once per command |
++---------------------------------------------------------------+
+                       |
+                       | route: shardIndex = fnv1a(key) % shardCount
+                       v
++---------------------------------------------------------------+
+| cache (internal/cache)                                        |
+|                                                               |
+|  shard 0        shard 1             shard 15                  |
+|  +---------+    +---------+         +---------+               |
+|  | map     |    | map     |         | map     |               |
+|  | LRU list|    | LRU list|   ...   | LRU list|               |
+|  | mutex   |    | mutex   |         | mutex   |               |
+|  +---------+    +---------+         +---------+               |
+|                                                               |
+|  every Entry: value, ExpiresAt, LastAccess,                   |
+|               AccessCount, Version, estimated Size            |
++---------------------------------------------------------------+
+                       |
+                       v
++---------------------------------------------------------------+
+| background + observability                                    |
+|   janitor goroutine        - sweeps expired keys every 1s      |
+|   metrics collector        - command counters, latency hist.,  |
+|                              hits/misses, evictions, conns     |
+|                              -> HTTP :9090 /metrics + /healthz |
+|   SIGINT/SIGTERM handler   - stops accepting, drains conns     |
++---------------------------------------------------------------+
+```
+
+The two listeners share the same collector, so `STATS` over TCP and
+`/metrics` over HTTP show the same numbers.
+
+### What happens on SET
+
+```
+SET session:9 "active session" EX 60
+
+1. read the line, tokenize          -> Command{SET, [session:9, active session, EX, 60]}
+2. parse the options                -> ttl = 60s
+3. hash the key                     -> fnv1a("session:9") % 16 = shard 7
+4. lock shard 7
+5. new Entry                        -> ExpiresAt = now + 60s,
+                                       Size = len(key)+len(value)+96
+6. add size to the shard total
+7. push Entry to the LRU front
+8. while shard over budget: pop LRU back, subtract its size,
+   count an eviction (with policy "none": reject instead, reply ERR)
+9. unlock
+10. reply OK
+```
+
+### What happens on GET
+
+```
+GET session:9
+
+1..3. same parse and routing, lands on the same shard 7
+4. lock shard 7
+5. lookup: missing?                                -> unlock, reply (nil)
+          expired (now >= ExpiresAt)?              -> delete, unlock, reply (nil)
+          live                     -> LastAccess = now,
+                                      AccessCount++,
+                                      move to LRU front,
+                                      count the hit (misses are counted
+                                      on the missing/expired paths)
+6. unlock
+7. write the raw value bytes + newline
+```
+
+Step 5 is why expiry needs no background work to be correct for reads: the
+entry cannot be answered as live after its deadline, because every read
+re-checks the deadline under the shard lock. The janitor only exists so
+expired keys nobody reads stop occupying memory.
+
+### Why the shards matter
+
+The point of the whole `hash -> shard` step is that a `GET h` on shard 3 never
+has to wait for a mutex held by `GET a` on shard 1. In the architecture above
+the only shared structures between connections are the metrics counters
+(atomic) and the listener. Everything else on the hot path is per shard.
+That is what the benchmark in the section below measures: 16 shards serve
+parallel reads roughly 3x faster than one shard on the same hardware.
 
 ## Design notes
 
